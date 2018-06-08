@@ -1,11 +1,11 @@
 -- This file was automatically generated for the LuaDist project.
 
 package = "luapgsql"
-version = "1.6.1-0"
+version = "1.6.1-1"
 
 -- LuaDist source
 source = {
-  tag = "1.6.1-0",
+  tag = "1.6.1-1",
   url = "git://github.com/LuaDist-testing/luapgsql.git"
 }
 -- Original source
@@ -17,7 +17,7 @@ source = {
 
 description = {
 	summary = "A Lua Binding for PostgreSQL";
-	homepage = "http://github.com/mbalmer/luapgsql";
+	homepage = "https://github.com/arcapos/luapgsql";
 	license = "3-clause BSD";
 }
 
