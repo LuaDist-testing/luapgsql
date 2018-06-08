@@ -1,11 +1,19 @@
-package = "luapgsql"
-version = "1.4.2-0"
+-- This file was automatically generated for the LuaDist project.
 
+package = "luapgsql"
+version = "1.6.1-0"
+
+-- LuaDist source
 source = {
-	url = "http://github.com/mbalmer/luapgsql/archive/1.4.2.zip";
-	md5 = "044cf06a9917099b740445fceeb08fc4";
-	dir = "luapgsql-1.4.2";
+  tag = "1.6.1-0",
+  url = "git://github.com/LuaDist-testing/luapgsql.git"
 }
+-- Original source
+-- source = {
+-- 	url = "https://github.com/arcapos/luapgsql/archive/1.6.1.zip";
+-- 	md5 = "f9d7cbb1d12d46b259bc556a096d51c5";
+-- 	dir = "luapgsql-1.6.1";
+-- }
 
 description = {
 	summary = "A Lua Binding for PostgreSQL";
@@ -14,7 +22,7 @@ description = {
 }
 
 dependencies = {
-	"lua >= 5.1, < 5.3";
+	"lua >= 5.1, < 5.4";
 }
 
 external_dependencies = {

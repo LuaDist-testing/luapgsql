@@ -50,8 +50,50 @@
 #if LUA_VERSION_NUM < 502
 #define lua_setuservalue lua_setfenv
 #define lua_getuservalue lua_getfenv
+
+static void
+luaL_setmetatable(lua_State *L, const char *tname)
+{
+	luaL_getmetatable(L, tname);
+	lua_setmetatable(L, -2);
+}
 #endif
 
+/*
+ * Garbage collected memory
+ */
+static void *
+gcmalloc(lua_State *L, size_t size)
+{
+	void **p;
+
+	p = lua_newuserdata(L, size);
+	*p = NULL;
+	luaL_setmetatable(L, GCMEM_METATABLE);
+	return p;
+}
+
+/* Memory can be free'ed immediately or left to the garbage collector */
+static void
+gcfree(void *p)
+{
+	void **mem = (void **)p;
+	PQfreemem(*mem);
+	*mem = NULL;
+}
+
+static int
+gcmem_clear(lua_State *L)
+{
+	void **p = luaL_checkudata(L, 1, GCMEM_METATABLE);
+	PQfreemem(*p);
+	*p = NULL;
+	return 0;
+}
+
+/*
+ * Create a new connection object with a uservalue table
+ */
 static PGconn **
 pgsql_conn_new(lua_State *L) {
 	PGconn **data;
@@ -60,8 +102,7 @@ pgsql_conn_new(lua_State *L) {
 	*data = NULL;
 	lua_newtable(L);
 	lua_setuservalue(L, -2);
-	luaL_getmetatable(L, CONN_METATABLE);
-	lua_setmetatable(L, -2);
+	luaL_setmetatable(L, CONN_METATABLE);
 	return data;
 }
 
@@ -72,9 +113,12 @@ static int
 pgsql_connectdb(lua_State *L)
 {
 	PGconn **data;
+	const char *cstr;
 
+	cstr = luaL_checkstring(L, 1);
 	data = pgsql_conn_new(L);
-	*data = PQconnectdb(luaL_checkstring(L, 1));
+
+	*data = PQconnectdb(cstr);
 	if (*data == NULL)
 		lua_pushnil(L);
 	return 1;
@@ -84,9 +128,12 @@ static int
 pgsql_connectStart(lua_State *L)
 {
 	PGconn **data;
+	const char *cstr;
 
+	cstr = luaL_checkstring(L, 1);
 	data = pgsql_conn_new(L);
-	*data = PQconnectStart(luaL_checkstring(L, 1));
+	*data = PQconnectStart(cstr);
+
 	if (*data == NULL)
 		lua_pushnil(L);
 	return 1;
@@ -128,15 +175,34 @@ pgsql_ping(lua_State *L)
 static int
 pgsql_encryptPassword(lua_State *L)
 {
-	char *encrypted;
+	char const **pw;
+	const char *passwd, *user;
 
-	encrypted = PQencryptPassword(luaL_checkstring(L, 1),
-	    luaL_checkstring(L, 2));
-	if (encrypted != NULL) {
-		lua_pushstring(L, encrypted);
-		PQfreemem(encrypted);
-	} else
+	passwd = luaL_checkstring(L, 1);
+	user = luaL_checkstring(L, 2);
+	pw = gcmalloc(L, sizeof(char *));
+	*pw = PQencryptPassword(passwd, user);
+	lua_pushstring(L, *pw);
+	gcfree(pw);
+	return 1;
+}
+
+static int
+pgsql_unescapeBytea(lua_State *L)
+{
+	unsigned char **p;
+	size_t len;
+	const char *bytea;
+
+	bytea = luaL_checkstring(L, 1);
+	p = gcmalloc(L, sizeof(char *));
+	*p = PQunescapeBytea((const unsigned char *)bytea, &len);
+	if (*p == NULL)
 		lua_pushnil(L);
+	else {
+		lua_pushlstring(L, (const char *)*p, len);
+		gcfree(p);
+	}
 	return 1;
 }
 
@@ -184,8 +250,7 @@ conn_finish(lua_State *L)
 			lua_getuservalue(L, 1);
 			lua_pushnil(L);
 			lua_setfield(L, -2, "trace_file");
-		} else
-			lua_pop(L, 1);
+		}
 	}
 	return 0;
 }
@@ -200,7 +265,7 @@ conn_reset(lua_State *L)
 static int
 conn_resetStart(lua_State *L)
 {
-	lua_pushinteger(L, PQresetStart(pgsql_conn(L, 1)));
+	lua_pushboolean(L, PQresetStart(pgsql_conn(L, 1)));
 	return 1;
 }
 
@@ -266,7 +331,10 @@ conn_options(lua_State *L)
 static int
 conn_status(lua_State *L)
 {
-	lua_pushinteger(L, PQstatus(pgsql_conn(L, 1)));
+	PGconn **conn;
+
+	conn = luaL_checkudata(L, 1, CONN_METATABLE);
+	lua_pushinteger(L, PQstatus(*conn));
 	return 1;
 }
 
@@ -314,7 +382,13 @@ conn_errorMessage(lua_State *L)
 static int
 conn_socket(lua_State *L)
 {
-	lua_pushinteger(L, PQsocket(pgsql_conn(L, 1)));
+	int fd;
+
+	fd = PQsocket(pgsql_conn(L, 1));
+	if (fd >= 0)
+		lua_pushinteger(L, fd);
+	else
+		lua_pushnil(L);
 	return 1;
 }
 
@@ -378,34 +452,37 @@ conn_sslAttributeNames(lua_State *L)
 static int
 conn_exec(lua_State *L)
 {
+	PGconn *conn;
 	PGresult **res;
+	const char *command;
+
+	conn = pgsql_conn(L, 1);
+	command = luaL_checkstring(L, 2);
 
 	res = lua_newuserdata(L, sizeof(PGresult *));
-	*res = PQexec(pgsql_conn(L, 1), luaL_checkstring(L, 2));
-	luaL_getmetatable(L, RES_METATABLE);
-	lua_setmetatable(L, -2);
+	*res = PQexec(conn, command);
+	if (*res == NULL)
+		lua_pushnil(L);
+	else
+		luaL_setmetatable(L, RES_METATABLE);
 	return 1;
 }
 
-static int
-get_sql_params(lua_State *L, int t, int n, Oid *paramTypes, char **paramValues,
-    int *paramLengths, int *paramFormats, int *count)
+static void
+get_param(lua_State *L, int t, int n, Oid *paramTypes, char **paramValues,
+    int *paramLengths, int *paramFormats)
 {
-	int k, c;
-
 	switch (lua_type(L, t)) {
 	case LUA_TBOOLEAN:
 		if (paramTypes != NULL)
 			paramTypes[n] = BOOLOID;
 		if (paramValues != NULL) {
-			paramValues[n] = malloc(1);
-			if (paramValues[n] == NULL)
-				return -1;
+			paramValues[n] = lua_newuserdata(L, sizeof(char));
 			*(char *)paramValues[n] = lua_toboolean(L, t);
 			paramLengths[n] = 1;
-			paramFormats[n] = 1;
 		}
-		n = 1;
+		if (paramFormats != NULL)
+			paramFormats[n] = 1;
 		break;
 	case LUA_TNUMBER:
 		if (paramTypes != NULL) {
@@ -428,14 +505,12 @@ get_sql_params(lua_State *L, int t, int n, Oid *paramTypes, char **paramValues,
 			else
 #endif
 				swap.v = lua_tonumber(L, t);
-			paramValues[n] = malloc(sizeof(uint64_t));
-			if (paramValues[n] == NULL)
-				return -1;
+			paramValues[n] = lua_newuserdata(L, sizeof(uint64_t));
 			*(uint64_t *)paramValues[n] = htobe64(swap.i);
 			paramLengths[n] = sizeof(uint64_t);
-			paramFormats[n] = 1;
 		}
-		n = 1;
+		if (paramFormats != NULL)
+			paramFormats[n] = 1;
 		break;
 	case LUA_TSTRING:
 		if (paramTypes != NULL)
@@ -445,232 +520,191 @@ get_sql_params(lua_State *L, int t, int n, Oid *paramTypes, char **paramValues,
 			size_t len;
 
 			s = lua_tolstring(L, t, &len);
-			paramValues[n] = malloc(len + 1);
-			if (paramValues[n] == NULL)
-				return -1;
+			paramValues[n] = lua_newuserdata(L, len + 1);
 			/*
 			 * lua_tolstring returns a string with '\0' after
 			 * the last character.
 			 */
 			memcpy(paramValues[n], s, len + 1);
 		}
-		n = 1;
+		if (paramFormats != NULL)
+			paramFormats[n] = 0;
 		break;
 	case LUA_TNIL:
+		if (paramTypes != NULL)
+			paramTypes[n] = 0;
 		if (paramValues != NULL)
 			paramValues[n] = NULL;
-		n = 1;
-		break;
-	case LUA_TTABLE:
-		for (k = 1;; k++) {
-			lua_pushinteger(L, k);
-			lua_gettable(L, t);
-			if (lua_isnil(L, -1))
-				break;
-			c = 0;
-			if (get_sql_params(L, -1, n, paramTypes, paramValues,
-			    paramLengths, paramFormats, &c))
-			    	return -1;
-			n += c;
-			lua_pop(L, 1);
-		}
-		lua_pop(L, 1);
+		if (paramFormats != NULL)
+			paramFormats[n] = 0;
 		break;
 	default:
-		return luaL_argerror(L, t, "unsupported type");
+		luaL_error(L, "unsupported PostgreSQL parameter type %s ("
+		    "use table.unpack() for table types)", luaL_typename(L, t));
+		/* NOTREACHED */
 	}
-	*count = n;
-	return 0;
 }
 
 static int
 conn_execParams(lua_State *L)
 {
+	PGconn *conn;
 	PGresult **res;
 	Oid *paramTypes;
 	char **paramValues;
-	int n, nParams, sqlParams, *paramLengths, *paramFormats, count;
+	const char *command;
+	int n, nParams, *paramLengths, *paramFormats;
+
+	conn = pgsql_conn(L, 1);
+	command = luaL_checkstring(L, 2);
 
 	nParams = lua_gettop(L) - 2;	/* subtract connection and command */
-	if (nParams < 0)
-		nParams = 0;
 
-	for (n = 0, sqlParams = 0; n < nParams; n++) {
-		get_sql_params(L, 3 + n, sqlParams, NULL, NULL, NULL, NULL,
-		    &count);
-		sqlParams += count;
-	}
-	if (sqlParams) {
-		paramTypes = calloc(sqlParams, sizeof(Oid));
-		paramValues = calloc(sqlParams, sizeof(char *));
-		paramLengths = calloc(sqlParams, sizeof(int));
-		paramFormats = calloc(sqlParams, sizeof(int));
+	if (nParams > 65535)
+		luaL_error(L, "number of parameters must not exceed 65535");
 
-		if (paramTypes == NULL || paramValues == NULL
-		    || paramLengths == NULL || paramFormats == NULL)
-		    	goto errout;
+	if (nParams) {
+		luaL_checkstack(L, 4 + nParams, "out of stack space");
 
-		for (n = 0, sqlParams = 0; n < nParams; n++) {
-			if (get_sql_params(L, 3 + n, sqlParams, paramTypes,
-			    paramValues, paramLengths, paramFormats, &count))
-			    	goto errout;
-			sqlParams += count;
-		}
+		paramTypes = lua_newuserdata(L, nParams * sizeof(Oid));
+		paramValues = lua_newuserdata(L, nParams * sizeof(char *));
+		paramLengths = lua_newuserdata(L, nParams * sizeof(int));
+		paramFormats = lua_newuserdata(L, nParams * sizeof(int));
+
+		for (n = 0; n < nParams; n++)
+			get_param(L, 3 + n, n, paramTypes, paramValues,
+			    paramLengths, paramFormats);
 	} else {
 		paramTypes = NULL;
 		paramValues = NULL;
 		paramLengths = NULL;
 		paramFormats = NULL;
 	}
+	luaL_checkstack(L, 2, "out of stack space");
 	res = lua_newuserdata(L, sizeof(PGresult *));
-	*res = PQexecParams(pgsql_conn(L, 1),
-	    luaL_checkstring(L, 2), sqlParams, paramTypes,
+	*res = PQexecParams(conn, command, nParams, paramTypes,
 	    (const char * const*)paramValues, paramLengths, paramFormats, 0);
-	luaL_getmetatable(L, RES_METATABLE);
-	lua_setmetatable(L, -2);
-	if (sqlParams) {
-		for (n = 0; n < sqlParams; n++)
-			free((void *)paramValues[n]);
-		free(paramTypes);
-		free(paramValues);
-		free(paramLengths);
-		free(paramFormats);
-	}
+	if (*res == NULL)
+		lua_pushnil(L);
+	else
+		luaL_setmetatable(L, RES_METATABLE);
 	return 1;
-
-errout:
-	if (paramValues) {
-		for (n = 0; n < sqlParams; n++)
-			free((void *)paramValues[n]);
-		free(paramValues);
-	}
-	free(paramTypes);
-	free(paramLengths);
-	free(paramFormats);
-	return luaL_error(L, "out of memory");
 }
 
 static int
 conn_prepare(lua_State *L)
 {
+	PGconn *conn;
 	PGresult **res;
 	Oid *paramTypes;
-	int n, nParams, sqlParams, count;
+	const char *command, *name;
+	int n, nParams;
+
+	conn = pgsql_conn(L, 1);
+	command = luaL_checkstring(L, 2);
+	name = luaL_checkstring(L, 3);
 
 	nParams = lua_gettop(L) - 3;	/* subtract connection, name, command */
-	if (nParams < 0)
-		nParams = 0;
 
-	for (n = 0, sqlParams = 0; n < nParams; n++) {
-		get_sql_params(L, 4 + n, sqlParams, NULL, NULL, NULL, NULL,
-		    &count);
-		sqlParams += count;
-	}
-	if (sqlParams) {
-		paramTypes = calloc(sqlParams, sizeof(Oid));
-		if (paramTypes == NULL)
-			return luaL_error(L, "out of memory");
+	if (nParams > 65535)
+		luaL_error(L, "number of parameters must not exceed 65535");
 
-		for (n = 0, sqlParams = 0; n < nParams; n++) {
-			if (get_sql_params(L, 4 + n, sqlParams,
-			    paramTypes, NULL, NULL, NULL, &count)) {
-			    	free(paramTypes);
-			    	return luaL_error(L, "out of memory");
-			}
-			sqlParams += count;
-		}
+	if (nParams) {
+		paramTypes = lua_newuserdata(L, nParams * sizeof(Oid));
+
+		for (n = 0; n < nParams; n++)
+			get_param(L, 4 + n, n, paramTypes, NULL, NULL, NULL);
 	} else
 		paramTypes = NULL;
+
 	res = lua_newuserdata(L, sizeof(PGresult *));
-	*res = PQprepare(pgsql_conn(L, 1), luaL_checkstring(L, 2),
-	    luaL_checkstring(L, 3), sqlParams, paramTypes);
-	luaL_getmetatable(L, RES_METATABLE);
-	lua_setmetatable(L, -2);
-	if (sqlParams)
-		free(paramTypes);
+	*res = PQprepare(conn, command, name, nParams, paramTypes);
+	if (*res == NULL)
+		lua_pushnil(L);
+	else
+		luaL_setmetatable(L, RES_METATABLE);
 	return 1;
 }
 
 static int
 conn_execPrepared(lua_State *L)
 {
+	PGconn *conn;
 	PGresult **res;
 	char **paramValues;
-	int n, nParams, sqlParams, *paramLengths, *paramFormats, count;
+	const char *command;
+	int n, nParams, *paramLengths, *paramFormats;
+
+	conn = pgsql_conn(L, 1);
+	command = luaL_checkstring(L, 2);
 
 	nParams = lua_gettop(L) - 2;	/* subtract connection and name */
-	if (nParams < 0)
-		nParams = 0;
 
-	for (n = 0, sqlParams = 0; n < nParams; n++) {
-		get_sql_params(L, 3 + n, sqlParams, NULL, NULL,  NULL, NULL,
-		    &count);
-		sqlParams += count;
-	}
-	if (sqlParams) {
-		paramValues = calloc(sqlParams, sizeof(char *));
-		paramLengths = calloc(sqlParams, sizeof(int));
-		paramFormats = calloc(sqlParams, sizeof(int));
+	if (nParams > 65535)
+		luaL_error(L, "number of parameters must not exceed 65535");
 
-		if (paramValues == NULL || paramLengths == NULL
-		    || paramFormats == NULL)
-		    	goto errout;
+	if (nParams) {
+		luaL_checkstack(L, 3 + nParams, "out of stack space");
 
-		for (n = 0, sqlParams = 0; n < nParams; n++) {
-			if (get_sql_params(L, 3 + n, sqlParams, NULL,
-			    paramValues, paramLengths, paramFormats, &count))
-			    	goto errout;
-			sqlParams += count;
-		}
+		paramValues = lua_newuserdata(L, nParams * sizeof(char *));
+		paramLengths = lua_newuserdata(L, nParams * sizeof(int));
+		paramFormats = lua_newuserdata(L, nParams * sizeof(int));
+
+		for (n = 0; n < nParams; n++)
+			get_param(L, 3 + n, n, NULL, paramValues, paramLengths,
+			    paramFormats);
 	} else {
 		paramValues = NULL;
 		paramLengths = NULL;
 		paramFormats = NULL;
 	}
+	luaL_checkstack(L, 2, "out of stack space");
+
 	res = lua_newuserdata(L, sizeof(PGresult *));
-	*res = PQexecPrepared(pgsql_conn(L, 1), luaL_checkstring(L, 2),
-	    sqlParams, (const char * const*)paramValues, paramLengths,
-	    paramFormats, 0);
-	luaL_getmetatable(L, RES_METATABLE);
-	lua_setmetatable(L, -2);
-	if (sqlParams) {
-		for (n = 0; n < sqlParams; n++)
-			free((void *)paramValues[n]);
-		free(paramValues);
-		free(paramLengths);
-		free(paramFormats);
-	}
+	*res = PQexecPrepared(conn, command, nParams,
+	    (const char * const*)paramValues, paramLengths, paramFormats, 0);
+	if (*res == NULL)
+		lua_pushnil(L);
+	else
+		luaL_setmetatable(L, RES_METATABLE);
 	return 1;
-errout:
-	if (paramValues) {
-		for (n = 0; n < sqlParams; n++)
-			free(paramValues[n]);
-		free(paramValues);
-	}
-	free(paramLengths);
-	free(paramFormats);
-	return luaL_error(L, "out of memory");
 }
 
 static int
 conn_describePrepared(lua_State *L)
 {
+	PGconn *conn;
 	PGresult **res;
+	const char *name;
+
+	conn = pgsql_conn(L, 1);
+	name = luaL_checkstring(L, 2);
+
 	res = lua_newuserdata(L, sizeof(PGresult *));
-	*res = PQdescribePrepared(pgsql_conn(L, 1), luaL_checkstring(L, 2));
-	luaL_getmetatable(L, RES_METATABLE);
-	lua_setmetatable(L, -2);
+	*res = PQdescribePrepared(conn, name);
+	if (*res == NULL)
+		lua_pushnil(L);
+	else
+		luaL_setmetatable(L, RES_METATABLE);
 	return 1;
 }
 
 static int
 conn_describePortal(lua_State *L)
 {
+	PGconn *conn;
 	PGresult **res;
+	const char *name;
+
+	conn = pgsql_conn(L, 1);
+	name = luaL_checkstring(L, 2);
+
 	res = lua_newuserdata(L, sizeof(PGresult *));
-	*res = PQdescribePortal(pgsql_conn(L, 1), luaL_checkstring(L, 2));
-	luaL_getmetatable(L, RES_METATABLE);
-	lua_setmetatable(L, -2);
+	*res = PQdescribePortal(conn, name);
+	if (*res == NULL)
+		lua_pushnil(L);
+	else
+		luaL_setmetatable(L, RES_METATABLE);
 	return 1;
 }
 
@@ -690,16 +724,13 @@ conn_escapeString(lua_State *L)
 		lua_pushnil(L);
 		return 1;
 	}
-	buf = calloc(len + 1, 2);
-	if (buf == NULL)
-		return luaL_error(L, "out of memory");
+	buf = lua_newuserdata(L, 2 * (len + 1));
 
 	PQescapeStringConn(d, buf, str, len, &error);
 	if (!error)
 		lua_pushstring(L, buf);
 	else
 		lua_pushnil(L);
-	free(buf);
 	return 1;
 }
 
@@ -707,15 +738,16 @@ static int
 conn_escapeLiteral(lua_State *L)
 {
 	const char *s;
-	char *p;
+	char **p;
 	PGconn *d;
 	size_t len;
 
 	d = pgsql_conn(L, 1);
 	s = luaL_checklstring(L, 2, &len);
-	p = PQescapeLiteral(d, s, len);
-	lua_pushstring(L, p);
-	PQfreemem(p);
+	p = gcmalloc(L, sizeof(char *));
+	*p = PQescapeLiteral(d, s, len);
+	lua_pushstring(L, *p);
+	gcfree(p);
 	return 1;
 }
 
@@ -723,50 +755,35 @@ static int
 conn_escapeIdentifier(lua_State *L)
 {
 	const char *s;
-	char *p;
+	char  **p;
 	PGconn *d;
 	size_t len;
 
 	d = pgsql_conn(L, 1);
 	s = luaL_checklstring(L, 2, &len);
-	p = PQescapeIdentifier(d, s, len);
-	lua_pushstring(L, p);
-	PQfreemem(p);
+	p = gcmalloc(L, sizeof(char *));
+	*p = PQescapeIdentifier(d, s, len);
+	lua_pushstring(L, *p);
+	gcfree(p);
 	return 1;
 }
 
 static int
 conn_escapeBytea(lua_State *L)
 {
-	unsigned char *p;
+	unsigned char **p;
 	const unsigned char *s;
 	PGconn *d;
 	size_t from_length, to_length;
 
 	d = pgsql_conn(L, 1);
 	s = (const unsigned char *)luaL_checklstring(L, 2, &from_length);
-	p = PQescapeByteaConn(d, s, from_length, &to_length);
-	lua_pushstring(L, (const char *)p);
+	p = gcmalloc(L, sizeof(char *));
+	*p = PQescapeByteaConn(d, s, from_length, &to_length);
+	lua_pushstring(L, (const char *)*p);
 	lua_pushinteger(L, to_length);
-	PQfreemem(p);
+	gcfree(p);
 	return 2;
-}
-
-static int
-conn_unescapeBytea(lua_State *L)
-{
-	unsigned char *p;
-	size_t len;
-
-	p = PQunescapeBytea((const unsigned char *)luaL_checkstring(L, 2),
-	    &len);
-	if (p == NULL)
-		lua_pushnil(L);
-	else {
-		lua_pushlstring(L, (const char *)p, len);
-		PQfreemem(p);
-	}
-	return 1;
 }
 
 /*
@@ -775,7 +792,7 @@ conn_unescapeBytea(lua_State *L)
 static int
 conn_sendQuery(lua_State *L)
 {
-	lua_pushinteger(L, PQsendQuery(pgsql_conn(L, 1),
+	lua_pushboolean(L, PQsendQuery(pgsql_conn(L, 1),
 	    luaL_checkstring(L, 2)));
 	return 1;
 }
@@ -783,163 +800,104 @@ conn_sendQuery(lua_State *L)
 static int
 conn_sendQueryParams(lua_State *L)
 {
+	PGconn *conn;
 	Oid *paramTypes;
 	char **paramValues;
-	int n, nParams, sqlParams, *paramLengths, *paramFormats, count;
+	const char *command;
+	int n, nParams, sqlParams, *paramLengths, *paramFormats;
+
+	conn = pgsql_conn(L, 1);
+	command = luaL_checkstring(L, 2);
 
 	nParams = lua_gettop(L) - 2;	/* subtract connection and command */
-	if (nParams < 0)
-		nParams = 0;
 
-	for (n = 0, sqlParams = 0; n < nParams; n++) {
-		get_sql_params(L, 3 + n, 0, NULL, NULL, NULL, NULL, &count);
-		sqlParams += count;
-	}
-	if (sqlParams) {
-		paramTypes = calloc(sqlParams, sizeof(Oid));
-		paramValues = calloc(sqlParams, sizeof(char *));
-		paramLengths = calloc(sqlParams, sizeof(int));
-		paramFormats = calloc(sqlParams, sizeof(int));
+	if (nParams) {
+		luaL_checkstack(L, 4 + nParams, "out of stack space");
 
-		if (paramTypes == NULL || paramValues == NULL
-		    || paramLengths == NULL || paramFormats == NULL)
-		    	goto errout;
+		paramTypes = lua_newuserdata(L, nParams * sizeof(Oid));
+		paramValues = lua_newuserdata(L, nParams * sizeof(char *));
+		paramLengths = lua_newuserdata(L, nParams * sizeof(int));
+		paramFormats = lua_newuserdata(L, nParams * sizeof(int));
 
-		for (n = 0, sqlParams = 0; n < nParams; n++) {
-			if (get_sql_params(L, 3 + n, sqlParams, paramTypes,
-			    paramValues, paramLengths, paramFormats, &count))
-			    	goto errout;
-			sqlParams += count;
-		}
+		for (n = 0; n < nParams; n++)
+			get_param(L, 3 + n, n, paramTypes, paramValues,
+			   paramLengths, paramFormats);
 	} else {
 		paramTypes = NULL;
 		paramValues = NULL;
 		paramLengths = NULL;
 		paramFormats = NULL;
 	}
-	lua_pushinteger(L,
-	    PQsendQueryParams(pgsql_conn(L, 1),
-	    luaL_checkstring(L, 2), sqlParams, paramTypes,
+	lua_pushboolean(L,
+	    PQsendQueryParams(conn, command, nParams, paramTypes,
 	    (const char * const*)paramValues, paramLengths, paramFormats, 0));
-	if (sqlParams) {
-		for (n = 0; n < sqlParams; n++)
-			free((void *)paramValues[n]);
-		free(paramTypes);
-		free(paramValues);
-		free(paramLengths);
-		free(paramFormats);
-	}
 	return 1;
-errout:
-	if (paramValues) {
-		for (n = 0; n < sqlParams; n++)
-			free((void *)paramValues[n]);
-		free(paramValues);
-	}
-	free(paramTypes);
-	free(paramLengths);
-	free(paramFormats);
-	return luaL_error(L, "out of memory");
 }
 
 static int
 conn_sendPrepare(lua_State *L)
 {
+	PGconn *conn;
 	Oid *paramTypes;
-	int n, nParams, sqlParams, count;
+	const char *command, *name;
+	int n, nParams;
+
+	conn = pgsql_conn(L, 1);
+	command = luaL_checkstring(L, 2);
+	name = luaL_checkstring(L, 3);
 
 	nParams = lua_gettop(L) - 3;	/* subtract connection, name, command */
-	if (nParams < 0)
-		nParams = 0;
 
-	for (n = 0, sqlParams = 0; n < nParams; n++) {
-		get_sql_params(L, 4 + n, 0, NULL, NULL, NULL, NULL, &count);
-		sqlParams += count;
-	}
-	if (sqlParams) {
-		paramTypes = calloc(sqlParams, sizeof(Oid));
-		if (paramTypes == NULL)
-			return luaL_error(L, "out of memory");
+	if (nParams) {
+		paramTypes = lua_newuserdata(L, nParams * sizeof(Oid));
 
-		for (n = 0, sqlParams = 0; n < nParams; n++) {
-			if (get_sql_params(L, 4 + n, sqlParams,
-			    paramTypes, NULL, NULL, NULL, &count)) {
-			    	free(paramTypes);
-			    	return luaL_error(L, "out of memory");
-			}
-			sqlParams += count;
-		}
+		for (n = 0; n < nParams; n++)
+			get_param(L, 4 + n, n, paramTypes, NULL, NULL, NULL);
 	} else
 		paramTypes = NULL;
-	lua_pushinteger(L, PQsendPrepare(pgsql_conn(L, 1),
-	    luaL_checkstring(L, 2), luaL_checkstring(L, 3), sqlParams,
-	    paramTypes));
-	if (sqlParams)
-		free(paramTypes);
+	lua_pushboolean(L,
+	    PQsendPrepare(conn, command, name, nParams, paramTypes));
 	return 1;
 }
 
 static int
 conn_sendQueryPrepared(lua_State *L)
 {
+	PGconn *conn;
 	char **paramValues;
-	int n, nParams, sqlParams, *paramLengths, *paramFormats, count;
+	const char *name;
+	int n, nParams, *paramLengths, *paramFormats;
+
+	conn = pgsql_conn(L, 1);
+	name = luaL_checkstring(L, 2);
 
 	nParams = lua_gettop(L) - 2;	/* subtract connection and name */
-	if (nParams < 0)
-		nParams = 0;
 
-	for (n = 0, sqlParams = 0; n < nParams; n++) {
-		get_sql_params(L, 3 + n, 0, NULL, NULL, NULL, NULL, &count);
-		sqlParams += count;
-	}
-	if (sqlParams) {
-		paramValues = calloc(sqlParams, sizeof(char *));
-		paramLengths = calloc(sqlParams, sizeof(int));
-		paramFormats = calloc(sqlParams, sizeof(int));
+	if (nParams) {
+		luaL_checkstack(L, 3 + nParams, "out of stack space");
 
-		if (paramValues == NULL || paramLengths == NULL
-		    || paramFormats == NULL)
-		    	goto errout;
+		paramValues = lua_newuserdata(L, nParams * sizeof(char *));
+		paramLengths = lua_newuserdata(L, nParams * sizeof(int));
+		paramFormats = lua_newuserdata(L, nParams * sizeof(int));
 
-		for (n = 0, sqlParams = 0; n < nParams; n++) {
-			if (get_sql_params(L, 3 + n, sqlParams, NULL,
-			    paramValues, paramLengths, paramFormats, &count))
-			    	goto errout;
-			sqlParams += count;
-		}
+		for (n = 0; n < nParams; n++)
+			get_param(L, 3 + n, n, NULL, paramValues, paramLengths,
+			    paramFormats);
 	} else {
 		paramValues = NULL;
 		paramLengths = NULL;
 		paramFormats = NULL;
 	}
-	lua_pushinteger(L,
-	    PQsendQueryPrepared(pgsql_conn(L, 1), luaL_checkstring(L, 2),
-	    nParams, (const char * const*)paramValues, paramLengths,
-	    paramFormats, 0));
-	if (nParams) {
-		for (n = 0; n < nParams; n++)
-			free((void *)paramValues[n]);
-		free(paramValues);
-		free(paramLengths);
-		free(paramFormats);
-	}
+	lua_pushboolean(L,
+	    PQsendQueryPrepared(conn, name, nParams,
+	    (const char * const*)paramValues, paramLengths, paramFormats, 0));
 	return 1;
-errout:
-	if (paramValues) {
-		for (n = 0; n < nParams; n++)
-			free(paramValues[n]);
-		free(paramValues);
-	}
-	free(paramLengths);
-	free(paramFormats);
-	return luaL_error(L, "out of memory");
 }
 
 static int
 conn_sendDescribePrepared(lua_State *L)
 {
-	lua_pushinteger(L,
+	lua_pushboolean(L,
 	    PQsendDescribePrepared(pgsql_conn(L, 1), luaL_checkstring(L, 2)));
 	return 1;
 }
@@ -947,7 +905,7 @@ conn_sendDescribePrepared(lua_State *L)
 static int
 conn_sendDescribePortal(lua_State *L)
 {
-	lua_pushinteger(L,
+	lua_pushboolean(L,
 	    PQsendDescribePortal(pgsql_conn(L, 1), luaL_checkstring(L, 2)));
 	return 1;
 }
@@ -963,8 +921,7 @@ conn_getResult(lua_State *L)
 	else {
 		res = lua_newuserdata(L, sizeof(PGresult *));
 		*res = r;
-		luaL_getmetatable(L, RES_METATABLE);
-		lua_setmetatable(L, -2);
+		luaL_setmetatable(L, RES_METATABLE);
 	}
 	return 1;
 }
@@ -996,7 +953,7 @@ conn_cancel(lua_State *L)
 static int
 conn_setSingleRowMode(lua_State *L)
 {
-	lua_pushinteger(L, PQsetSingleRowMode(pgsql_conn(L, 1)));
+	lua_pushboolean(L, PQsetSingleRowMode(pgsql_conn(L, 1)));
 	return 1;
 }
 #endif
@@ -1015,8 +972,7 @@ conn_notifies(lua_State *L)
 	else {
 		notify = lua_newuserdata(L, sizeof(PGnotify *));
 		*notify = n;
-		luaL_getmetatable(L, NOTIFY_METATABLE);
-		lua_setmetatable(L, -2);
+		luaL_setmetatable(L, NOTIFY_METATABLE);
 	}
 	return 1;
 }
@@ -1029,32 +985,52 @@ conn_putCopyData(lua_State *L)
 {
 	const char *data;
 	size_t len;
+	int r;
 
 	data = luaL_checklstring(L, 2, &len);
-	lua_pushinteger(L, PQputCopyData(pgsql_conn(L, 1), data, len));
+	r = PQputCopyData(pgsql_conn(L, 1), data, len);
+
+	if (r != -1)
+		lua_pushboolean(L, r);
+	else
+		lua_pushnil(L);
 	return 1;
 }
 
 static int
 conn_putCopyEnd(lua_State *L)
 {
-	lua_pushinteger(L, PQputCopyEnd(pgsql_conn(L, 1), NULL));
+	int r;
+
+	r = PQputCopyEnd(pgsql_conn(L, 1), NULL);
+
+	if (r != -1)
+		lua_pushboolean(L, r);
+	else
+		lua_pushnil(L);
 	return 1;
 }
 
 static int
 conn_getCopyData(lua_State *L)
 {
-	int res;
-	char *data;
+	PGconn *conn;
+	int async, len;
+	char **data;
 
-	res = PQgetCopyData(pgsql_conn(L, 1), &data, 0);
-	if (res > 0)
-		lua_pushstring(L, data);
-	else
+	conn = pgsql_conn(L, 1);
+	async = lua_toboolean(L, 2);
+	data = gcmalloc(L, sizeof(char *));
+	len = PQgetCopyData(conn, data, async);
+	if (len > 0)
+		lua_pushlstring(L, *data, len);
+	else if (len == 0)	/* no data yet */
+		lua_pushboolean(L, 0);
+	else if (len == -1)	/* copy done */
+		lua_pushboolean(L, 1);
+	else			/* an error occurred */
 		lua_pushnil(L);
-	if (data)
-		PQfreemem(data);
+	gcfree(data);
 	return 1;
 }
 
@@ -1223,8 +1199,10 @@ conn_isBusy(lua_State *L)
 static int
 conn_setnonblocking(lua_State *L)
 {
-	lua_pushinteger(L,
-	    PQsetnonblocking(pgsql_conn(L, 1), lua_toboolean(L, 2)));
+	int r;
+
+	r = PQsetnonblocking(pgsql_conn(L, 1), lua_toboolean(L, 2));
+	lua_pushboolean(L, !r);
 	return 1;
 }
 
@@ -1238,7 +1216,14 @@ conn_isnonblocking(lua_State *L)
 static int
 conn_flush(lua_State *L)
 {
-	lua_pushinteger(L, PQflush(pgsql_conn(L, 1)));
+	int r;
+
+	r = PQflush(pgsql_conn(L, 1));
+
+	if (r >= 0)
+		lua_pushboolean(L, r == 0);
+	else
+		lua_pushnil(L);
 	return 1;
 }
 
@@ -1251,10 +1236,10 @@ noticeReceiver(void *arg, const PGresult *r)
 
 	lua_pushstring(L, "__pgsqlNoticeReceiver");
 	lua_rawget(L, LUA_REGISTRYINDEX);
+
 	res = lua_newuserdata(L, sizeof(PGresult *));
 	*res = (PGresult *)r;
-	luaL_getmetatable(L, RES_METATABLE);
-	lua_setmetatable(L, -2);
+	luaL_setmetatable(L, RES_METATABLE);
 
 	if (lua_pcall(L, 1, 0, 0))
 		luaL_error(L, "%s", lua_tostring(L, -1));
@@ -1326,25 +1311,119 @@ conn_lo_import_with_oid(lua_State *L)
 static int
 conn_lo_export(lua_State *L)
 {
-	lua_pushinteger(L,
-	    lo_export(pgsql_conn(L, 1), luaL_checkinteger(L, 2),
-	    luaL_checkstring(L, 3)));
+	int r;
+
+	r = lo_export(pgsql_conn(L, 1), luaL_checkinteger(L, 2),
+	    luaL_checkstring(L, 3));
+
+	lua_pushboolean(L, r == 1);
 	return 1;
 }
 
 static int
 conn_lo_open(lua_State *L)
 {
-	largeObject **o;
+	int fd;
 
-	o = lua_newuserdata(L, sizeof(largeObject *));
-	(*o)->conn = pgsql_conn(L, 1);
-	(*o)->fd = lo_open((*o)->conn, luaL_checkinteger(L, 2),
+	fd = lo_open(pgsql_conn(L, 1), luaL_checkinteger(L, 2),
 	    luaL_checkinteger(L, 3));
-	luaL_getmetatable(L, LO_METATABLE);
-	lua_setmetatable(L, -2);
+	if (fd == -1)
+		lua_pushnil(L);
+	else
+		lua_pushinteger(L, fd);
 	return 1;
 }
+
+static int
+conn_lo_write(lua_State *L)
+{
+	const char *s;
+	size_t len;
+
+	s = lua_tolstring(L, 3, &len);
+	lua_pushinteger(L, lo_write(pgsql_conn(L, 1), luaL_checkinteger(L, 2),
+	    s, len));
+	return 1;
+}
+
+static int
+conn_lo_read(lua_State *L)
+{
+	char *buf;
+	size_t len;
+
+	len = luaL_checkinteger(L, 3);
+	buf = lua_newuserdata(L, len);
+	len = lo_read(pgsql_conn(L, 1), luaL_checkinteger(L, 2), buf, len);
+	lua_pushlstring(L, buf, len);
+	lua_pushinteger(L, len);
+	return 2;
+}
+
+static int
+conn_lo_lseek(lua_State *L)
+{
+	lua_pushinteger(L, lo_lseek(pgsql_conn(L, 1), luaL_checkinteger(L, 2),
+	    luaL_checkinteger(L, 3), luaL_checkinteger(L, 4)));
+	return 1;
+}
+
+static int
+conn_lo_tell(lua_State *L)
+{
+	lua_pushinteger(L, lo_tell(pgsql_conn(L, 1), luaL_checkinteger(L, 2)));
+	return 1;
+}
+
+static int
+conn_lo_truncate(lua_State *L)
+{
+	lua_pushinteger(L, lo_truncate(pgsql_conn(L, 1),
+	    luaL_checkinteger(L, 2), luaL_checkinteger(L, 3)));
+	return 1;
+}
+
+static int
+conn_lo_close(lua_State *L)
+{
+	lua_pushboolean(L,
+	    lo_close(pgsql_conn(L, 1), luaL_checkinteger(L, 2)) == 0);
+	return 1;
+}
+
+static int
+conn_lo_unlink(lua_State *L)
+{
+	lua_pushboolean(L,
+	    lo_unlink(pgsql_conn(L, 1), luaL_checkinteger(L, 2)) == 1);
+	return 1;
+}
+
+#if PG_VERSION_NUM >= 90300
+static int
+conn_lo_lseek64(lua_State *L)
+{
+	lua_pushinteger(L, lo_lseek64(pgsql_conn(L, 1), luaL_checkinteger(L, 2),
+	    luaL_checkinteger(L, 3), luaL_checkinteger(L, 4)));
+	return 1;
+}
+
+static int
+conn_lo_tell64(lua_State *L)
+{
+	lua_pushinteger(L,
+	    lo_tell64(pgsql_conn(L, 1), luaL_checkinteger(L, 2)));
+	return 1;
+}
+
+static int
+conn_lo_truncate64(lua_State *L)
+{
+	lua_pushinteger(L, lo_truncate64(pgsql_conn(L, 1),
+	    luaL_checkinteger(L, 2), luaL_checkinteger(L, 3)));
+	return 1;
+}
+#endif
 
 /*
  * Result set functions
@@ -1479,7 +1558,7 @@ res_fsize(lua_State *L)
 static int
 res_binaryTuples(lua_State *L)
 {
-	lua_pushinteger(L,
+	lua_pushboolean(L,
 	    PQbinaryTuples(*(PGresult **)luaL_checkudata(L, 1, RES_METATABLE)));
 	return 1;
 }
@@ -1588,6 +1667,7 @@ res_fields_iterator(lua_State *L)
 
 	t->row++;
 
+	luaL_checkstack(L, PQnfields(t->res), "out of stack space");
 	if (t->row == PQntuples(t->res))
 		for (n = 0; n < PQnfields(t->res); n++)
 			lua_pushnil(L);
@@ -1604,10 +1684,9 @@ res_fields(lua_State *L)
 
 	lua_pushcfunction(L, res_fields_iterator);
 	t = lua_newuserdata(L, sizeof(tuple));
+	luaL_setmetatable(L, TUPLE_METATABLE);
 	t->res = *(PGresult **)luaL_checkudata(L, 1, RES_METATABLE);
 	t->row = -1;
-	luaL_getmetatable(L, TUPLE_METATABLE);
-	lua_setmetatable(L, -2);
 	return 2;
 }
 
@@ -1631,14 +1710,16 @@ res_tuples_iterator(lua_State *L)
 static int
 res_tuples(lua_State *L)
 {
+	PGresult **res;
 	tuple *t;
+
+	res = (PGresult **)luaL_checkudata(L, 1, RES_METATABLE);
 
 	lua_pushcfunction(L, res_tuples_iterator);
 	t = lua_newuserdata(L, sizeof(tuple));
-	t->res = *(PGresult **)luaL_checkudata(L, 1, RES_METATABLE);
+	luaL_setmetatable(L, TUPLE_METATABLE);
+	t->res = *res;
 	t->row = -1;
-	luaL_getmetatable(L, TUPLE_METATABLE);
-	lua_setmetatable(L, -2);
 	return 2;
 }
 
@@ -1659,8 +1740,7 @@ res_index(lua_State *L)
 			t = lua_newuserdata(L, sizeof(tuple));
 			t->res = res;
 			t->row = row;
-			luaL_getmetatable(L, TUPLE_METATABLE);
-			lua_setmetatable(L, -2);
+			luaL_setmetatable(L, TUPLE_METATABLE);
 		}
 	} else {
 		const char *nam;
@@ -1681,7 +1761,7 @@ res_clear(lua_State *L)
 	PGresult **r;
 
 	r = luaL_checkudata(L, 1, RES_METATABLE);
-	if (r && *r)  {
+	if (*r) {
 		PQclear(*r);
 		*r = NULL;
 	}
@@ -1727,96 +1807,9 @@ notify_clear(lua_State *L)
 	PGnotify **n;
 
 	n = luaL_checkudata(L, 1, NOTIFY_METATABLE);
-	if (*n)  {
+	if (*n) {
 		PQfreemem(*n);
 		*n = NULL;
-	}
-	return 0;
-}
-
-/*
- * Large object functions
- */
-static int
-pgsql_lo_write(lua_State *L)
-{
-	largeObject **o;
-	const char *s;
-	size_t len;
-
-	o = luaL_checkudata(L, 1, LO_METATABLE);
-	s = lua_tolstring(L, 2, &len);
-	lua_pushinteger(L, lo_write((*o)->conn, (*o)->fd, s, len));
-	return 1;
-}
-
-static int
-pgsql_lo_read(lua_State *L)
-{
-	largeObject **o;
-	int res;
-	char buf[256];	/* arbitrary size */
-
-	o = luaL_checkudata(L, 1, LO_METATABLE);
-	/* XXX don't hard code the buffer size */
-	res = lo_read((*o)->conn, (*o)->fd, buf, sizeof buf);
-	lua_pushstring(L, buf);
-	lua_pushinteger(L, res);
-	return 2;
-}
-
-static int
-pgsql_lo_lseek(lua_State *L)
-{
-	largeObject **o;
-
-	o = luaL_checkudata(L, 1, LO_METATABLE);
-	lua_pushinteger(L, lo_lseek((*o)->conn, (*o)->fd,
-	    luaL_checkinteger(L, 2), luaL_checkinteger(L, 3)));
-	return 1;
-}
-
-static int
-pgsql_lo_tell(lua_State *L)
-{
-	largeObject **o;
-
-	o = luaL_checkudata(L, 1, LO_METATABLE);
-	lua_pushinteger(L, lo_tell((*o)->conn, (*o)->fd));
-	return 1;
-}
-
-static int
-pgsql_lo_truncate(lua_State *L)
-{
-	largeObject **o;
-
-	o = luaL_checkudata(L, 1, LO_METATABLE);
-	lua_pushinteger(L, lo_truncate((*o)->conn, (*o)->fd,
-	    luaL_checkinteger(L, 2)));
-	return 1;
-}
-
-static int
-pgsql_lo_close(lua_State *L)
-{
-	largeObject **o;
-
-	o = luaL_checkudata(L, 1, LO_METATABLE);
-	lua_pushinteger(L, lo_close((*o)->conn, (*o)->fd));
-	*o = NULL;	/* prevent close during garbage collection time */
-	return 1;
-}
-
-static int
-pgsql_lo_clear(lua_State *L)
-{
-	largeObject **o;
-
-	o = luaL_checkudata(L, 1, LO_METATABLE);
-	if (*o)  {
-		lo_close((*o)->conn, (*o)->fd);
-		*o = NULL;
 	}
 	return 0;
 }
@@ -1866,8 +1859,7 @@ tuple_getfields(lua_State *L)
 	f = lua_newuserdata(L, sizeof(field));
 	f->tuple = t;
 	f->col = -1;
-	luaL_getmetatable(L, FIELD_METATABLE);
-	lua_setmetatable(L, -2);
+	luaL_setmetatable(L, FIELD_METATABLE);
 	return 2;
 }
 
@@ -2020,7 +2012,7 @@ static struct constant pgsql_constant[] = {
 	{ "PGRES_NONFATAL_ERROR",	PGRES_NONFATAL_ERROR },
 	{ "PGRES_FATAL_ERROR",		PGRES_FATAL_ERROR },
 
-	/* Polling status  */
+	/* Polling status */
 	{ "PGRES_POLLING_FAILED",	PGRES_POLLING_FAILED },
 	{ "PGRES_POLLING_READING",	PGRES_POLLING_READING },
 	{ "PGRES_POLLING_WRITING",	PGRES_POLLING_WRITING },
@@ -2081,7 +2073,7 @@ pgsql_set_info(lua_State *L)
 	lua_pushliteral(L, "PostgreSQL binding for Lua");
 	lua_settable(L, -3);
 	lua_pushliteral(L, "_VERSION");
-	lua_pushliteral(L, "pgsql 1.4.10");
+	lua_pushliteral(L, "pgsql 1.6.1");
 	lua_settable(L, -3);
 }
 
@@ -2098,6 +2090,7 @@ luaopen_pgsql(lua_State *L)
 		{ "ping", pgsql_ping },
 #endif
 		{ "encryptPassword", pgsql_encryptPassword },
+		{ "unescapeBytea", pgsql_unescapeBytea },
 
 		/* SSL support */
 		{ "initOpenSSL", pgsql_initOpenSSL },
@@ -2141,7 +2134,6 @@ luaopen_pgsql(lua_State *L)
 		{ "escapeLiteral", conn_escapeLiteral },
 		{ "escapeIdentifier", conn_escapeIdentifier },
 		{ "escapeBytea", conn_escapeBytea },
-		{ "unescapeBytea", conn_unescapeBytea },
 		{ "exec", conn_exec },
 		{ "execParams", conn_execParams },
 		{ "prepare", conn_prepare },
@@ -2196,6 +2188,19 @@ luaopen_pgsql(lua_State *L)
 		{ "lo_import_with_oid", conn_lo_import_with_oid },
 		{ "lo_export", conn_lo_export },
 		{ "lo_open", conn_lo_open },
+		{ "lo_write", conn_lo_write },
+		{ "lo_read", conn_lo_read },
+		{ "lo_lseek", conn_lo_lseek },
+		{ "lo_tell", conn_lo_tell },
+		{ "lo_truncate", conn_lo_truncate },
+		{ "lo_close", conn_lo_close },
+		{ "lo_unlink", conn_lo_unlink },
+#if PG_VERSION_NUM >= 90300
+		{ "lo_lseek64", conn_lo_lseek64 },
+		{ "lo_tell64", conn_lo_tell64 },
+		{ "lo_truncate64", conn_lo_truncate64 },
+#endif
+
 		{ NULL, NULL }
 	};
 	struct luaL_Reg res_methods[] = {
@@ -2239,15 +2244,6 @@ luaopen_pgsql(lua_State *L)
 		{ "relname", notify_relname },
 		{ "pid", notify_pid },
 		{ "extra", notify_extra },
-		{ NULL, NULL }
-	};
-	struct luaL_Reg lo_methods[] = {
-		{ "write", pgsql_lo_write },
-		{ "read", pgsql_lo_read },
-		{ "lseek", pgsql_lo_lseek },
-		{ "tell", pgsql_lo_tell },
-		{ "truncate", pgsql_lo_truncate },
-		{ "close", pgsql_lo_close },
 		{ NULL, NULL }
 	};
 	if (luaL_newmetatable(L, CONN_METATABLE)) {
@@ -2314,26 +2310,6 @@ luaopen_pgsql(lua_State *L)
 	}
 	lua_pop(L, 1);
 
-	if (luaL_newmetatable(L, LO_METATABLE)) {
-#if LUA_VERSION_NUM >= 502
-		luaL_setfuncs(L, lo_methods, 0);
-#else
-		luaL_register(L, NULL, lo_methods);
-#endif
-		lua_pushliteral(L, "__gc");
-		lua_pushcfunction(L, pgsql_lo_clear);
-		lua_settable(L, -3);
-
-		lua_pushliteral(L, "__index");
-		lua_pushvalue(L, -2);
-		lua_settable(L, -3);
-
-		lua_pushliteral(L, "__metatable");
-		lua_pushliteral(L, "must not access this metatable");
-		lua_settable(L, -3);
-	}
-	lua_pop(L, 1);
-
 	if (luaL_newmetatable(L, TUPLE_METATABLE)) {
 		lua_pushliteral(L, "__index");
 		lua_pushcfunction(L, tuple_index);
@@ -2352,6 +2328,13 @@ luaopen_pgsql(lua_State *L)
 	if (luaL_newmetatable(L, FIELD_METATABLE)) {
 		lua_pushliteral(L, "__metatable");
 		lua_pushliteral(L, "must not access this metatable");
+		lua_settable(L, -3);
+	}
+	lua_pop(L, 1);
+
+	if (luaL_newmetatable(L, GCMEM_METATABLE)) {
+		lua_pushliteral(L, "__gc");
+		lua_pushcfunction(L, gcmem_clear);
 		lua_settable(L, -3);
 	}
 	lua_pop(L, 1);
